@@ -69,6 +69,17 @@ The application features a built-in dashboard that visualizes:
 - **Performance History:** MCQ scores and completion rates.
 - **SRS Review Alerts:** Intelligent suggestions for what to study next based on forgetting curves.
 
+## 🖥️ App Screenshots
+
+### Login
+![Login](src/captured_image/login.png)
+
+### MCQ Quiz
+![MCQ Quiz](src/captured_image/ss_1.png)
+
+### Quiz Result
+![Quiz Result](src/captured_image/quiz_result.png)
+
 ## 📄 License
 
 MIT License — feel free to use, adapt, and build on this project.
