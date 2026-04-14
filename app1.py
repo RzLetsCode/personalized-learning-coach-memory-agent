@@ -19,7 +19,7 @@ from backend.auth.user_service import (
 )
 from backend.auth.security import is_strong_password
 from src.schemas import AgentState, Message
-from src.agent import agent_app
+from src.agent_v1 import agent_app
 from src.memory.semantic_memory import index_user_material
 from src.memory.srs_store import get_due_topics, get_mastery_summary
 from backend.database.models import MCQScore, KnowledgePoint
@@ -311,35 +311,16 @@ def render_quiz_analytics():
 # MCQ Rendering
 # ---------------------------------------------------------------------------
 def render_mcq_block_structured(data: dict):
-    """
-    Render MCQ JSON without exposing correct answers.
-    Expected shape:
-    {
-      "type": "mcq",
-      "topic": "...",
-      "difficulty": "...",
-      "questions": [
-        { "id": "q1", "question_text": "...", "options": {...}, "correct_answer": "A" }
-      ]
-    }
-    """
     topic = data.get("topic", "MCQ Quiz")
     difficulty = data.get("difficulty", "medium")
     questions = data.get("questions", [])
-
-    # Stable quiz-level id so keys do not clash between different quizzes
-    quiz_id = data.get("quiz_id", "default_quiz")
 
     st.markdown(f"### {topic}")
     st.markdown(f"**Difficulty:** {difficulty.capitalize()}")
     st.markdown("---")
 
-    # Persist user choices across reruns
-    if "mcq_user_choices" not in st.session_state:
-        st.session_state["mcq_user_choices"] = {}
-    user_choices = st.session_state["mcq_user_choices"].get(quiz_id, {})
+    user_choices = {}
 
-    # 1) Render questions
     for idx, q in enumerate(questions, start=1):
         qid = q.get("id", f"q{idx}")
         with st.container(border=True):
@@ -347,28 +328,18 @@ def render_mcq_block_structured(data: dict):
 
             option_keys = list(q["options"].keys())
 
-            # Compose a globally-unique key: quiz_id + question id
-            widget_key = f"mcq_{quiz_id}_{qid}"
-
-            current_value = user_choices.get(qid, option_keys[0])
-
             selected = st.radio(
                 "Select one option:",
                 options=option_keys,
                 format_func=lambda k: f"{k}. {q['options'][k]}",
-                key=widget_key,
-                index=option_keys.index(current_value) if current_value in option_keys else 0,
+                key=f"mcq_q_{qid}",
                 label_visibility="collapsed",
             )
 
             user_choices[qid] = selected
 
-    # Save updated choices back to session
-    st.session_state["mcq_user_choices"][quiz_id] = user_choices
-
-    # 2) Submit and show professional summary
-    if st.button("Submit Quiz", key=f"submit_mcq_quiz_{quiz_id}"):
-        # Build answer key from JSON if not already present
+    if st.button("Submit Quiz", key="submit_mcq_quiz"):
+        # Build mcq_answers from JSON if not already done
         if not st.session_state["mcq_answers"]:
             answers = {}
             for q in questions:
@@ -381,43 +352,26 @@ def render_mcq_block_structured(data: dict):
         answers = st.session_state.get("mcq_answers", {})
         correct_count = 0
         total = len(questions)
-        per_q_feedback = []
 
-        for idx, q in enumerate(questions, start=1):
-            qid = q.get("id", f"q{idx}")
+        for q in questions:
+            qid = q.get("id")
             user_ans = user_choices.get(qid)
             correct_ans = answers.get(qid)
 
             if correct_ans is None:
-                per_q_feedback.append(f"Q{idx}: No correct answer configured.")
+                st.warning(f"No correct answer cached for {qid}.")
                 continue
 
             if user_ans == correct_ans:
                 correct_count += 1
-                per_q_feedback.append(
-                    f"Q{idx}: ✅ Correct (you chose {user_ans})"
-                )
+                st.success(f"{qid}: Correct")
             else:
-                per_q_feedback.append(
-                    f"Q{idx}: ❌ Incorrect (you chose {user_ans}, correct is {correct_ans})"
-                )
+                st.error(f"{qid}: Incorrect")
 
+        st.info(f"Score: {correct_count} / {total}")
         st.session_state["last_quiz_score"] = correct_count
         st.session_state["last_quiz_total"] = total
 
-        st.markdown("---")
-        st.markdown("### ✅ Quiz Results")
-
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown(f"**Score:** {correct_count} / {total}")
-        with col2:
-            pct = round(correct_count / total * 100, 1) if total else 0.0
-            st.markdown(f"**Accuracy:** {pct}%")
-
-        st.markdown("#### Question-wise Feedback")
-        for line in per_q_feedback:
-            st.markdown(f"- {line}")
 # ---------------------------------------------------------------------------
 # CHAT INTERFACE
 # ---------------------------------------------------------------------------
@@ -438,8 +392,8 @@ def render_chat():
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    # 2) If there is an active quiz, re-render it (this keeps radios & results visible)
-    if st.session_state.get("current_mcq_json") is not None:
+    # 2) If there is an active quiz, re-render it
+    if st.session_state["current_mcq_json"] is not None:
         with st.chat_message("assistant"):
             render_mcq_block_structured(st.session_state["current_mcq_json"])
 
@@ -456,18 +410,18 @@ def render_chat():
     with st.chat_message("user"):
         st.markdown(user_input)
 
-    # 4) When a new turn starts, clear previous quiz state
+    # Clear previous quiz when new turn starts
     st.session_state["current_mcq_json"] = None
     st.session_state["mcq_answers"] = {}
-    st.session_state["mcq_user_choices"] = {}
 
-    # 5) Call agent once per turn
+    # 4) Call agent for this turn
     with st.chat_message("assistant"):
         with st.spinner("LearnMate is thinking..."):
             state = AgentState(
                 messages=[Message(role=m["role"], content=m["content"]) for m in st.session_state["messages"]],
                 user_id=st.session_state["user_id"],
                 session_db_id=st.session_state.get("session_db_id"),
+                # if AgentState has these:
                 # quiz_difficulty=st.session_state["quiz_difficulty"],
                 # quiz_num_questions=st.session_state["quiz_num_questions"],
             )
@@ -484,21 +438,17 @@ def render_chat():
             assistant_content = latest_assistant_msg.content if latest_assistant_msg else \
                 "I couldn't generate a response. Please try again."
 
-            # Try to parse as MCQ JSON
+            # Try MCQ JSON
             try:
                 parsed = json.loads(assistant_content)
             except Exception:
                 parsed = None
 
             if isinstance(parsed, dict) and parsed.get("type") == "mcq":
-                # Attach a quiz_id if not present
-                if "quiz_id" not in parsed:
-                    parsed["quiz_id"] = f"quiz_{len(st.session_state['messages'])}"
-
-                # Cache full JSON for stable re-renders
+                # Cache full quiz JSON
                 st.session_state["current_mcq_json"] = parsed
 
-                # Add a short summary line to chat history, not the raw JSON
+                # Short label in history
                 history_text = f"[MCQ quiz generated on: {parsed.get('topic', 'Quiz')}]"
                 st.session_state["messages"].append(
                     {"role": "assistant", "content": history_text}
@@ -506,7 +456,7 @@ def render_chat():
 
                 render_mcq_block_structured(parsed)
             else:
-                # Normal QA / analytics response
+                # Normal QA / analytics text
                 st.session_state["messages"].append(
                     {"role": "assistant", "content": assistant_content}
                 )

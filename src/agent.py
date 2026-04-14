@@ -1,14 +1,8 @@
 """
 LangGraph Agent for the Enterprise AI Learning Coach.
 
-Implements a full state machine with:
+State machine:
   intent_analyzer -> qa_node | mcq_node | analytics_node
-
-Each node:
-  - Reads/writes AgentState
-  - Calls the appropriate LLM with context-aware prompts
-  - Persists results to SQLAlchemy (MCQScore, KnowledgePoint)
-  - Uses Pinecone RAG for context retrieval
 """
 
 import os
@@ -17,7 +11,7 @@ import re
 from typing import Literal
 
 from langgraph.graph import StateGraph, START, END
-from langchain_openai import AzureChatOpenAI 
+from langchain_openai import AzureChatOpenAI
 
 from src.schemas import AgentState, Message
 from src import prompts
@@ -26,16 +20,14 @@ from src.memory.srs_store import update_after_review, get_due_topics, get_master
 from backend.database.db_session import get_db_session
 from backend.database.models import MCQScore, StudySession
 
-# ---------------------------------------------------------------------------
-# LLM instances
-# ---------------------------------------------------------------------------
+
 # ---------------------------------------------------------------------------
 # LLM instances (Azure OpenAI)
 # ---------------------------------------------------------------------------
 AZURE_API_KEY = os.environ.get("AZURE_OPENAI_API_KEY")
 AZURE_ENDPOINT = os.environ.get("AZURE_OPENAI_ENDPOINT")
 AZURE_API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-12-01-preview")
-AZURE_CHAT_MODEL = os.environ.get("AZURE_OPENAI_CHAT_MODEL", "gpt-4.1")  # or your deployment name
+AZURE_CHAT_MODEL = os.environ.get("AZURE_OPENAI_CHAT_MODEL", "gpt-4o")
 
 llm_common_kwargs = dict(
     api_key=AZURE_API_KEY,
@@ -49,17 +41,11 @@ llm_qa = AzureChatOpenAI(temperature=0.3, **llm_common_kwargs)
 llm_mcq = AzureChatOpenAI(temperature=0.4, **llm_common_kwargs)
 llm_analytics = AzureChatOpenAI(temperature=0.0, **llm_common_kwargs)
 
- 
-
 
 # ===========================================================================
 # NODE: Intent Analyzer
 # ===========================================================================
 def intent_analyzer(state: AgentState) -> AgentState:
-    """
-    Classify the user's last message into: qa | mcq | analytics.
-    Also extracts the topic for SRS updates.
-    """
     last_user_msg = next(
         (m.content for m in reversed(state.messages) if m.role == "user"), ""
     )
@@ -85,16 +71,11 @@ def intent_analyzer(state: AgentState) -> AgentState:
 # NODE: QA (Learning)
 # ===========================================================================
 def qa_node(state: AgentState) -> AgentState:
-    """
-    Answer learning questions using RAG context from the user's study materials.
-    Stores the Q&A in semantic memory and updates SRS.
-    """
     user_id = state.user_id
     last_user_msg = next(
         (m.content for m in reversed(state.messages) if m.role == "user"), ""
     )
 
-    # RAG retrieval
     context = ""
     if user_id is not None:
         context = get_context_for_query(user_id, last_user_msg, k=5)
@@ -102,28 +83,22 @@ def qa_node(state: AgentState) -> AgentState:
     profile_summary = f"User ID: {user_id} | Level: intermediate"
 
     messages = [
-        {"role": "system", "content": prompts.QA_SYSTEM_PROMPT.format(
-            context=context,
-            profile_summary=profile_summary,
-        )},
+        {
+            "role": "system",
+            "content": prompts.QA_SYSTEM_PROMPT.format(
+                context=context,
+                profile_summary=profile_summary,
+            ),
+        },
     ]
     for msg in state.messages:
         messages.append({"role": msg.role, "content": msg.content})
 
     resp = llm_qa.invoke(messages)
-    answer = resp.content
+    answer = resp.content  # plain markdown explanation
 
-    # Extract JSON memory instruction if present
     topic = state.topic or "general"
-    try:
-        json_match = re.search(r"```json(.*?)```", answer, re.DOTALL)
-        if json_match:
-            instruction = json.loads(json_match.group(1).strip())
-            topic = instruction.get("recommended_topics", ["general"])[0] if instruction.get("recommended_topics") else "general"
-    except Exception:
-        pass
 
-    # Persist Q&A to semantic memory and update SRS
     if user_id is not None:
         store_qa_memory(
             user_id=user_id,
@@ -147,52 +122,36 @@ def qa_node(state: AgentState) -> AgentState:
 # ===========================================================================
 def mcq_node(state: AgentState) -> AgentState:
     """
-    Generate or evaluate MCQs based on the user's study materials.
-    Saves MCQScore to the database and updates SRS.
+    Generate MCQ quiz as JSON (string); UI will render it as radio buttons.
     """
     user_id = state.user_id
     last_user_msg = next(
         (m.content for m in reversed(state.messages) if m.role == "user"), ""
     )
 
-    # RAG retrieval
     context = ""
     if user_id is not None:
         context = get_context_for_query(user_id, last_user_msg, k=4)
 
     topic = state.topic or "General AI/ML"
+
+    num_questions = getattr(state, "quiz_num_questions", 3)
+    difficulty = getattr(state, "quiz_difficulty", "medium")
+
     prompt_text = prompts.MCQ_SYSTEM_PROMPT.format(
         context=context,
         topic=topic,
-        num_questions=3,
-        difficulty="medium",
+        num_questions=num_questions,
+        difficulty=difficulty,
     )
 
     resp = llm_mcq.invoke([
         {"role": "system", "content": prompt_text},
         {"role": "user", "content": last_user_msg},
     ])
-    answer = resp.content
+    answer = resp.content  # JSON string (type: mcq)
 
-    # Persist MCQ result to DB
-    if user_id is not None and state.session_db_id is not None:
-        db = get_db_session()
-        try:
-            mcq_score = MCQScore(
-                user_id=user_id,
-                session_db_id=state.session_db_id,
-                topic=topic,
-                question_text=last_user_msg,
-                options={"A": "", "B": "", "C": "", "D": ""},
-                correct_answer="A",
-                is_correct=True,
-                difficulty_level="medium",
-            )
-            db.add(mcq_score)
-            db.commit()
-            update_after_review(db, user_id=user_id, topic=topic, quality=4)
-        finally:
-            db.close()
+    # Do not insert MCQScore here; grading and DB writes happen on the UI side.
 
     state.messages.append(Message(role="assistant", content=answer))
     state.mcq_context = answer
@@ -203,25 +162,26 @@ def mcq_node(state: AgentState) -> AgentState:
 # NODE: Analytics
 # ===========================================================================
 def analytics_node(state: AgentState) -> AgentState:
-    """
-    Query the database for learning stats and return a motivating summary.
-    No LLM call for data fetching - only for formatting the response.
-    """
     user_id = state.user_id
     if user_id is None:
-        state.messages.append(Message(
-            role="assistant",
-            content="Please log in to view your learning analytics.",
-        ))
+        state.messages.append(
+            Message(
+                role="assistant",
+                content="Please log in to view your learning analytics.",
+            )
+        )
         return state
 
     db = get_db_session()
     try:
         from backend.database.models import MCQScore as MCQModel
+
         total = db.query(MCQModel).filter(MCQModel.user_id == user_id).count()
-        correct = db.query(MCQModel).filter(
-            MCQModel.user_id == user_id, MCQModel.is_correct.is_(True)
-        ).count()
+        correct = (
+            db.query(MCQModel)
+            .filter(MCQModel.user_id == user_id, MCQModel.is_correct.is_(True))
+            .count()
+        )
         accuracy = round((correct / total * 100), 1) if total > 0 else 0.0
 
         mastery = get_mastery_summary(db, user_id)
@@ -239,12 +199,22 @@ def analytics_node(state: AgentState) -> AgentState:
     finally:
         db.close()
 
-    resp = llm_analytics.invoke([
-        {"role": "system", "content": prompts.ANALYTICS_SYSTEM_PROMPT.format(
-            analytics_data=analytics_data,
-        )},
-        {"role": "user", "content": state.messages[-1].content if state.messages else "Show my progress"},
-    ])
+    resp = llm_analytics.invoke(
+        [
+            {
+                "role": "system",
+                "content": prompts.ANALYTICS_SYSTEM_PROMPT.format(
+                    analytics_data=analytics_data,
+                ),
+            },
+            {
+                "role": "user",
+                "content": state.messages[-1].content
+                if state.messages
+                else "Show my progress",
+            },
+        ]
+    )
 
     state.messages.append(Message(role="assistant", content=resp.content))
     return state
@@ -254,7 +224,6 @@ def analytics_node(state: AgentState) -> AgentState:
 # LangGraph Graph Definition
 # ===========================================================================
 def _route_intent(state: AgentState) -> Literal["qa", "mcq", "analytics"]:
-    """Conditional edge: route based on detected intent."""
     intent = state.intent
     if intent == "mcq":
         return "mcq"
@@ -280,5 +249,4 @@ graph.add_edge("qa", END)
 graph.add_edge("mcq", END)
 graph.add_edge("analytics", END)
 
-# Compiled agent app (used in app.py via agent_app.invoke(state))
 agent_app = graph.compile()
